@@ -59,8 +59,11 @@ fn use_avx512() -> bool {
   cpuid::avx512()
 }
 
-/// Cached (once per process) runtime LASX availability.
-#[cfg(all(target_arch = "loongarch64", feature = "std"))]
+/// Cached (once per process) runtime LASX availability. Unlike x86 there is
+/// no user-mode way to ask whether the kernel saves the 256-bit register
+/// state, so only the OS-provided hwcaps behind `is_loongarch_feature_detected!`
+/// are trusted; the `lasx` feature therefore requires `std`.
+#[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
 fn use_lasx() -> bool {
   static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
   *CACHE.get_or_init(|| std::arch::is_loongarch_feature_detected!("lasx"))
@@ -115,6 +118,20 @@ pub(crate) fn fill_span_solid(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb:
       #[allow(unsafe_code)]
       unsafe {
         avx2::fill_span_opaque_avx2(dst_v, cov_v, color)
+      }
+      fill_span_solid_scalar(dst_tail, cov_tail, sr, sg, sb, sa);
+      return;
+    }
+    #[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
+    if _large_canvas && dst.len() >= SIMD_MIN_SPAN && use_lasx() {
+      let n = dst.len().min(cov.len());
+      let full = n - n % 8;
+      let (dst_v, dst_tail) = dst.split_at_mut(full);
+      let (cov_v, cov_tail) = cov.split_at(full);
+      // SAFETY: `use_lasx()` gates on `is_loongarch_feature_detected!("lasx")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        lasx::fill_span_opaque_lasx(dst_v, cov_v, color)
       }
       fill_span_solid_scalar(dst_tail, cov_tail, sr, sg, sb, sa);
       return;
@@ -207,6 +224,22 @@ pub(crate) fn fill_span_solid(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb:
           sse2::fill_span_solid_sse2(dst_v, cov_v, sr, sg, sb, sa)
         };
       }
+      fill_span_solid_scalar(dst_tail, cov_tail, sr, sg, sb, sa);
+      return;
+    }
+  }
+  #[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
+  {
+    if dst.len() >= SIMD_MIN_SPAN && use_lasx() {
+      let n = dst.len().min(cov.len());
+      let full = n - n % 8;
+      let (dst_v, dst_tail) = dst.split_at_mut(full);
+      let (cov_v, cov_tail) = cov.split_at(full.min(cov.len()));
+      // SAFETY: `use_lasx` gates on `is_loongarch_feature_detected!("lasx")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        lasx::fill_span_solid_lasx(dst_v, cov_v, sr, sg, sb, sa)
+      };
       fill_span_solid_scalar(dst_tail, cov_tail, sr, sg, sb, sa);
       return;
     }
@@ -343,6 +376,20 @@ pub(crate) fn fill_span_uniform(dst: &mut [u32], cov: u8, sr: u32, sg: u32, sb: 
       return;
     }
   }
+  #[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
+  {
+    if dst.len() >= SIMD_MIN_SPAN && use_lasx() {
+      let full = dst.len() - dst.len() % 8;
+      let (dst_v, dst_tail) = dst.split_at_mut(full);
+      // SAFETY: `use_lasx` gates on `is_loongarch_feature_detected!("lasx")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        lasx::fill_span_uniform_lasx(dst_v, ca, s_r, s_g, s_b)
+      };
+      fill_span_uniform_scalar(dst_tail, ca, s_r, s_g, s_b);
+      return;
+    }
+  }
   fill_span_uniform_scalar(dst, ca, s_r, s_g, s_b);
 }
 
@@ -463,6 +510,20 @@ pub(crate) fn linear_lut_fill(out: &mut [u32], lut: &[u32], row_base: f32, dt: f
       return;
     }
   }
+  #[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
+  {
+    if out.len() >= SIMD_MIN_SPAN && use_lasx() {
+      let full = out.len() - out.len() % 8;
+      let (head, tail) = out.split_at_mut(full);
+      // SAFETY: `use_lasx` gates on `is_loongarch_feature_detected!("lasx")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        lasx::linear_lut_fill_lasx(head, lut, row_base, dt, x_start, scale)
+      };
+      linear_lut_fill_scalar(tail, lut, row_base, dt, x_start + full as f32, scale);
+      return;
+    }
+  }
   linear_lut_fill_scalar(out, lut, row_base, dt, x_start, scale);
 }
 
@@ -556,6 +617,20 @@ pub(crate) fn radial_lut_fill(out: &mut [u32], lut: &[u32], dd0x: f32, dd0y: f32
       return;
     }
   }
+  #[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
+  {
+    if out.len() >= SIMD_MIN_SPAN && use_lasx() {
+      let full = out.len() - out.len() % 8;
+      let (head, tail) = out.split_at_mut(full);
+      // SAFETY: `use_lasx` gates on `is_loongarch_feature_detected!("lasx")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        lasx::radial_lut_fill_lasx(head, lut, dd0x, dd0y, da, db, inv_r, x_start, scale)
+      };
+      radial_lut_fill_scalar(tail, lut, dd0x, dd0y, da, db, inv_r, x_start + full as f32, scale);
+      return;
+    }
+  }
   radial_lut_fill_scalar(out, lut, dd0x, dd0y, da, db, inv_r, x_start, scale);
 }
 
@@ -643,6 +718,20 @@ pub(crate) fn focal_lut_fill(out: &mut [u32], lut: &[u32], g0x: f32, g0y: f32, s
           sse2::focal_lut_fill_sse2(head, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start, scale)
         };
       }
+      focal_lut_fill_scalar(tail, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start + full as f32, scale);
+      return;
+    }
+  }
+  #[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
+  {
+    if out.len() >= SIMD_MIN_SPAN && use_lasx() {
+      let full = out.len() - out.len() % 8;
+      let (head, tail) = out.split_at_mut(full);
+      // SAFETY: `use_lasx` gates on `is_loongarch_feature_detected!("lasx")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        lasx::focal_lut_fill_lasx(head, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start, scale)
+      };
       focal_lut_fill_scalar(tail, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start + full as f32, scale);
       return;
     }
@@ -761,6 +850,22 @@ pub(crate) fn composite_over_span(dst: &mut [u32], src: &[u32], k: u32) {
           sse2::composite_over_sse2(dst_v, src_v, k)
         };
       }
+      composite_over_scalar(dst_tail, src_tail, k);
+      return;
+    }
+  }
+  #[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
+  {
+    if dst.len() >= SIMD_MIN_SPAN && use_lasx() {
+      let n = dst.len().min(src.len());
+      let full = n - n % 8;
+      let (dst_v, dst_tail) = dst.split_at_mut(full);
+      let (src_v, src_tail) = src.split_at(full);
+      // SAFETY: `use_lasx` gates on `is_loongarch_feature_detected!("lasx")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        lasx::composite_over_lasx(dst_v, src_v, k)
+      };
       composite_over_scalar(dst_tail, src_tail, k);
       return;
     }
@@ -921,6 +1026,20 @@ pub(crate) fn linear_lut_over(dst: &mut [u32], lut: &[u32], row_base: f32, dt: f
       return;
     }
   }
+  #[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
+  {
+    if dst.len() >= SIMD_MIN_SPAN && use_lasx() {
+      let full = dst.len() - dst.len() % 8;
+      let (head, tail) = dst.split_at_mut(full);
+      // SAFETY: `use_lasx` gates on `is_loongarch_feature_detected!("lasx")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        lasx::linear_lut_over_lasx(head, lut, row_base, dt, x_start, scale)
+      };
+      linear_lut_over_scalar(tail, lut, row_base, dt, x_start + full as f32, scale);
+      return;
+    }
+  }
   linear_lut_over_scalar(dst, lut, row_base, dt, x_start, scale);
 }
 
@@ -1000,6 +1119,20 @@ pub(crate) fn radial_lut_over(dst: &mut [u32], lut: &[u32], dd0x: f32, dd0y: f32
           sse2::radial_lut_over_sse2(head, lut, dd0x, dd0y, da, db, inv_r, x_start, scale)
         };
       }
+      radial_lut_over_scalar(tail, lut, dd0x, dd0y, da, db, inv_r, x_start + full as f32, scale);
+      return;
+    }
+  }
+  #[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
+  {
+    if dst.len() >= SIMD_MIN_SPAN && use_lasx() {
+      let full = dst.len() - dst.len() % 8;
+      let (head, tail) = dst.split_at_mut(full);
+      // SAFETY: `use_lasx` gates on `is_loongarch_feature_detected!("lasx")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        lasx::radial_lut_over_lasx(head, lut, dd0x, dd0y, da, db, inv_r, x_start, scale)
+      };
       radial_lut_over_scalar(tail, lut, dd0x, dd0y, da, db, inv_r, x_start + full as f32, scale);
       return;
     }
@@ -1087,6 +1220,20 @@ pub(crate) fn focal_lut_over(dst: &mut [u32], lut: &[u32], g0x: f32, g0y: f32, s
           sse2::focal_lut_over_sse2(head, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start, scale)
         };
       }
+      focal_lut_over_scalar(tail, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start + full as f32, scale);
+      return;
+    }
+  }
+  #[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
+  {
+    if dst.len() >= SIMD_MIN_SPAN && use_lasx() {
+      let full = dst.len() - dst.len() % 8;
+      let (head, tail) = dst.split_at_mut(full);
+      // SAFETY: `use_lasx` gates on `is_loongarch_feature_detected!("lasx")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        lasx::focal_lut_over_lasx(head, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start, scale)
+      };
       focal_lut_over_scalar(tail, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start + full as f32, scale);
       return;
     }
@@ -1184,6 +1331,18 @@ pub(crate) fn alpha_blend_solid(dst: &mut [u8], coverage: &[u8], alpha: u8) {
     alpha_blend_solid_scalar(tail, &coverage[full..n], alpha);
     return;
   }
+  #[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
+  if n >= SIMD_MIN_SPAN && use_lasx() {
+    let full = n - n % 32;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    // SAFETY: `use_lasx` gates on `is_loongarch_feature_detected!("lasx")`.
+    #[allow(unsafe_code)]
+    unsafe {
+      lasx::alpha_blend_solid_lasx(head, &coverage[..full], alpha)
+    };
+    alpha_blend_solid_scalar(tail, &coverage[full..n], alpha);
+    return;
+  }
   alpha_blend_solid_scalar(&mut dst[..n], &coverage[..n], alpha);
 }
 
@@ -1248,6 +1407,18 @@ pub(crate) fn alpha_blend_product(dst: &mut [u8], lhs: &[u8], rhs: &[u8]) {
         sse2::alpha_blend_product_sse2(head, &lhs[..full], &rhs[..full])
       };
     }
+    alpha_blend_product_scalar(tail, &lhs[full..n], &rhs[full..n]);
+    return;
+  }
+  #[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
+  if n >= SIMD_MIN_SPAN && use_lasx() {
+    let full = n - n % 32;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    // SAFETY: `use_lasx` gates on `is_loongarch_feature_detected!("lasx")`.
+    #[allow(unsafe_code)]
+    unsafe {
+      lasx::alpha_blend_product_lasx(head, &lhs[..full], &rhs[..full])
+    };
     alpha_blend_product_scalar(tail, &lhs[full..n], &rhs[full..n]);
     return;
   }
@@ -1325,6 +1496,18 @@ pub(crate) fn alpha_blend_uniform(dst: &mut [u8], coverage: u8, alpha: u8) {
     alpha_blend_uniform_scalar(tail, source);
     return;
   }
+  #[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
+  if dst.len() >= SIMD_MIN_SPAN && use_lasx() {
+    let full = dst.len() - dst.len() % 32;
+    let (head, tail) = dst.split_at_mut(full);
+    // SAFETY: `use_lasx` gates on `is_loongarch_feature_detected!("lasx")`.
+    #[allow(unsafe_code)]
+    unsafe {
+      lasx::alpha_blend_uniform_lasx(head, source as u8)
+    };
+    alpha_blend_uniform_scalar(tail, source);
+    return;
+  }
   alpha_blend_uniform_scalar(dst, source);
 }
 
@@ -1391,6 +1574,18 @@ pub(crate) fn alpha_composite_over(dst: &mut [u8], src: &[u8], opacity: u8) {
         sse2::alpha_composite_over_sse2(head, &src[..full], opacity)
       };
     }
+    alpha_composite_over_scalar(tail, &src[full..n], opacity);
+    return;
+  }
+  #[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
+  if n >= SIMD_MIN_SPAN && use_lasx() {
+    let full = n - n % 32;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    // SAFETY: `use_lasx` gates on `is_loongarch_feature_detected!("lasx")`.
+    #[allow(unsafe_code)]
+    unsafe {
+      lasx::alpha_composite_over_lasx(head, &src[..full], opacity)
+    };
     alpha_composite_over_scalar(tail, &src[full..n], opacity);
     return;
   }
@@ -1461,6 +1656,18 @@ pub(crate) fn alpha_multiply(dst: &mut [u8], factors: &[u8]) {
     alpha_multiply_scalar(tail, &factors[full..n]);
     return;
   }
+  #[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
+  if n >= SIMD_MIN_SPAN && use_lasx() {
+    let full = n - n % 32;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    // SAFETY: `use_lasx` gates on `is_loongarch_feature_detected!("lasx")`.
+    #[allow(unsafe_code)]
+    unsafe {
+      lasx::alpha_multiply_lasx(head, &factors[..full])
+    };
+    alpha_multiply_scalar(tail, &factors[full..n]);
+    return;
+  }
   alpha_multiply_scalar(&mut dst[..n], &factors[..n]);
 }
 
@@ -1524,6 +1731,18 @@ pub(crate) fn alpha_matte(dst: &mut [u8], src: &[u8], opacity: u8, inverted: boo
         sse2::alpha_matte_sse2(head, &src[..full], opacity, inverted)
       };
     }
+    alpha_matte_scalar(tail, &src[full..n], opacity, inverted);
+    return;
+  }
+  #[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
+  if n >= SIMD_MIN_SPAN && use_lasx() {
+    let full = n - n % 32;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    // SAFETY: `use_lasx` gates on `is_loongarch_feature_detected!("lasx")`.
+    #[allow(unsafe_code)]
+    unsafe {
+      lasx::alpha_matte_lasx(head, &src[..full], opacity, inverted)
+    };
     alpha_matte_scalar(tail, &src[full..n], opacity, inverted);
     return;
   }
@@ -1592,6 +1811,18 @@ pub(crate) fn alpha_mask_combine(dst: &mut [u8], src: &[u8], mode: u8, inverted:
         sse2::alpha_mask_combine_sse2(head, &src[..full], mode, inverted, opacity)
       };
     }
+    alpha_mask_combine_scalar(tail, &src[full..n], mode, inverted, opacity);
+    return;
+  }
+  #[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
+  if n >= SIMD_MIN_SPAN && use_lasx() {
+    let full = n - n % 32;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    // SAFETY: `use_lasx` gates on `is_loongarch_feature_detected!("lasx")`.
+    #[allow(unsafe_code)]
+    unsafe {
+      lasx::alpha_mask_combine_lasx(head, &src[..full], mode, inverted, opacity)
+    };
     alpha_mask_combine_scalar(tail, &src[full..n], mode, inverted, opacity);
     return;
   }
@@ -1677,6 +1908,18 @@ pub(crate) fn apply_matte_alpha(dst: &mut [u32], src: &[u32], source_opacity: u8
     apply_matte_alpha_scalar(tail, &src[full..n], source_opacity, inverted);
     return;
   }
+  #[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
+  if n >= SIMD_MIN_SPAN && use_lasx() {
+    let full = n - n % 8;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    // SAFETY: `use_lasx` gates on `is_loongarch_feature_detected!("lasx")`.
+    #[allow(unsafe_code)]
+    unsafe {
+      lasx::apply_matte_alpha_lasx(head, &src[..full], source_opacity, inverted)
+    };
+    apply_matte_alpha_scalar(tail, &src[full..n], source_opacity, inverted);
+    return;
+  }
   apply_matte_alpha_scalar(&mut dst[..n], &src[..n], source_opacity, inverted);
 }
 
@@ -1718,7 +1961,7 @@ mod avx2;
 #[path = "simd/avx512.rs"]
 mod avx512;
 
-#[cfg(target_arch = "loongarch64")]
+#[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
 #[path = "simd/lasx.rs"]
 mod lasx;
 

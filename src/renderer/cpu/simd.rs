@@ -58,6 +58,14 @@ fn use_avx512() -> bool {
 fn use_avx512() -> bool {
   cpuid::avx512()
 }
+
+/// Cached (once per process) runtime LASX availability.
+#[cfg(all(target_arch = "loongarch64", feature = "std"))]
+fn use_lasx() -> bool {
+  static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+  *CACHE.get_or_init(|| std::arch::is_loongarch_feature_detected!("lasx"))
+}
+
 /// Coverage-modulated solid source-over: for each pixel,
 /// `ca = (cov*sa+127)/255`, source channels scaled by `ca`, then
 /// premultiplied source-over into `dst`. `sr/sg/sb/sa` are 0..=255.
@@ -1709,6 +1717,10 @@ mod avx2;
 #[cfg(target_arch = "x86_64")]
 #[path = "simd/avx512.rs"]
 mod avx512;
+
+#[cfg(target_arch = "loongarch64")]
+#[path = "simd/lasx.rs"]
+mod lasx;
 
 #[cfg(test)]
 #[path = "tests/simd.rs"]

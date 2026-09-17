@@ -1,7 +1,10 @@
 //! LASX kernels, 8 pixels (u32) / 32 pixels (Alpha8) per iteration.
 
 use core::arch::loongarch64::{
-  m256, m256i,
+  lasx_cast_128, lasx_extract_128_hi, lasx_vext2xv_hu_bu, lasx_xbnz_h, lasx_xbz_v, lasx_xvadd_h, lasx_xvand_v, lasx_xvbitclri_w, lasx_xvfadd_s, lasx_xvfcmp_cle_s, lasx_xvfcmp_clt_s, lasx_xvfmax_s,
+  lasx_xvfmin_s, lasx_xvfmul_s, lasx_xvfsqrt_s, lasx_xvfsub_s, lasx_xvftintrz_w_s, lasx_xvilvl_b, lasx_xvilvl_h, lasx_xvinsgr2vr_w, lasx_xvld, lasx_xvmax_h, lasx_xvmin_h, lasx_xvmul_h, lasx_xvorn_v,
+  lasx_xvpermi_d, lasx_xvreplgr2vr_d, lasx_xvreplgr2vr_h, lasx_xvreplgr2vr_w, lasx_xvrepli_h, lasx_xvrepli_w, lasx_xvseq_h, lasx_xvshuf4i_h, lasx_xvsrli_h, lasx_xvssrani_bu_h, lasx_xvst,
+  lasx_xvsub_h, m256, m256i,
 };
 
 /// Widens the low 16 bytes of `v` (first 4 pixels) to 16 u16 lanes.
@@ -22,7 +25,7 @@ fn hi(v: m256i) -> m256i {
 #[inline]
 #[target_feature(enable = "lasx")]
 fn div255_round(n: m256i) -> m256i {
-  let t = lasx_xvadd_h(n, lasx_xvrepli_h(255));
+  let t = lasx_xvadd_h(n, lasx_xvrepli_h(127));
   let u = lasx_xvadd_h(lasx_xvadd_h(t, lasx_xvsrli_h::<8>(t)), lasx_xvrepli_h(1));
   lasx_xvsrli_h::<8>(u)
 }
@@ -31,10 +34,7 @@ fn div255_round(n: m256i) -> m256i {
 #[inline]
 #[target_feature(enable = "lasx")]
 fn over(d: m256i, s: m256i, inv: m256i) -> m256i {
-  lasx_xvmin_h(
-    lasx_xvadd_h(s, lasx_xvsrli_h::<8>(lasx_xvmul_h(d, lasx_xvadd_h(inv, lasx_xvrepli_h(1))))),
-    lasx_xvrepli_h(255),
-  )
+  lasx_xvmin_h(lasx_xvadd_h(s, lasx_xvsrli_h::<8>(lasx_xvmul_h(d, lasx_xvadd_h(inv, lasx_xvrepli_h(1))))), lasx_xvrepli_h(255))
 }
 
 #[inline]
@@ -56,7 +56,7 @@ fn splat_alpha(half: m256i) -> m256i {
 #[inline]
 #[target_feature(enable = "lasx")]
 fn pack(a: m256i, b: m256i) -> m256i {
-  lasx_xvpermi_d(lasx_xvssrani_bu_h(a, b, 0), 0xD8)
+  lasx_xvpermi_d(lasx_xvssrani_bu_h(b, a, 0), 0xD8)
 }
 
 /// Unaligned 32-byte load.
@@ -277,8 +277,10 @@ pub(super) fn composite_over_lasx(dst: &mut [u32], src: &[u32], k: u32) {
 #[inline]
 #[target_feature(enable = "lasx")]
 fn splat_float(x: f32) -> m256 {
-    #[allow(unsafe_code)]
-    unsafe { core::mem::transmute(lasx_xvreplgr2vr_w(x.to_bits() as i32)) }
+  #[allow(unsafe_code)]
+  unsafe {
+    core::mem::transmute(lasx_xvreplgr2vr_w(x.to_bits() as i32))
+  }
 }
 
 /// Clamp + LUT index conversion shared by the gradient kernels:
@@ -289,18 +291,14 @@ fn splat_float(x: f32) -> m256 {
 #[target_feature(enable = "lasx")]
 fn lut_indices(t: m256, valid: m256i, scale: m256) -> m256i {
   #[allow(unsafe_code)]
-  unsafe { let zero : m256 = core::mem::transmute(lasx_xvrepli_w(0)) };
+  let zero: m256 = unsafe { core::mem::transmute(lasx_xvrepli_w(0)) };
   let tc = lasx_xvfmin_s(lasx_xvfmax_s(t, zero), splat_float(1.0));
   let idx = lasx_xvftintrz_w_s(lasx_xvfadd_s(lasx_xvfmul_s(tc, scale), splat_float(0.5)));
   // (vi & idx) | (~vi & -1)  ==  idx | ~vi
   lasx_xvorn_v(idx, valid)
 }
 
-/// 8-lane LUT gather LASX don't support gather. Index lanes with the `u32::MAX`
-/// sentinel have their gather mask cleared, so they read nothing and land on
-/// the zero offset = transparent, matching scalar `unwrap_or(0)`. The mask
-/// lanes are inverted relative to the compare (sentinel is negative as a signed
-/// i32, so `zero > idx` identifies it).
+/// 8-lane LUT gather LASX don't support gather.
 #[inline]
 #[target_feature(enable = "lasx")]
 fn lut_gather(lut: &[u32], idx: m256i) -> m256i {
@@ -311,19 +309,10 @@ fn lut_gather(lut: &[u32], idx: m256i) -> m256i {
   unsafe {
     lasx_xvst(idx, raw.as_mut_ptr().cast(), 0)
   };
-  let [i0, i1, i2, i3, i4, i5, i6, i7] = raw;
-  [
-    lut.get(i0 as usize).copied().unwrap_or(0),
-    lut.get(i1 as usize).copied().unwrap_or(0),
-    lut.get(i2 as usize).copied().unwrap_or(0),
-    lut.get(i3 as usize).copied().unwrap_or(0),
-    lut.get(i4 as usize).copied().unwrap_or(0),
-    lut.get(i5 as usize).copied().unwrap_or(0),
-    lut.get(i6 as usize).copied().unwrap_or(0),
-    lut.get(i7 as usize).copied().unwrap_or(0),
-  ]
+  let raw = raw.map(|i| lut.get(i as usize).copied().unwrap_or(0));
+  #[allow(unsafe_code)]
   unsafe {
-    lasx_xvld(lasx_xvrepli_w(0), raw.as_mut_ptr().cast(), 0)
+    lasx_xvld(raw.as_ptr().cast(), 0)
   }
 }
 
@@ -352,7 +341,9 @@ fn lut_blend_over_k255(dpx: &mut [u32], lut: &[u32], idx: m256i) {
 #[target_feature(enable = "lasx")]
 fn abs_float(v: m256) -> m256 {
   #[allow(unsafe_code)]
-  unsafe { core::mem::transmute(lasx_xvbitclri_w::<31>(core::mem::transmute(v))) }
+  unsafe {
+    core::mem::transmute(lasx_xvbitclri_w::<31>(core::mem::transmute(v)))
+  }
 }
 
 /// Absolute device columns for one 8-lane chunk.
@@ -360,9 +351,7 @@ fn abs_float(v: m256) -> m256 {
 #[target_feature(enable = "lasx")]
 fn lane_columns(x_start: f32) -> m256 {
   #[allow(unsafe_code)]
-  unsafe { 
-    let lanes: m256 = core::mem::transmute([0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
-  }
+  let lanes: m256 = unsafe { core::mem::transmute([0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]) };
   lasx_xvfadd_s(splat_float(x_start), lanes)
 }
 
@@ -466,7 +455,7 @@ pub(super) fn focal_lut_fill_lasx(out: &mut [u32], lut: &[u32], g0x: f32, g0y: f
     // LASX xvfmax_s follows IEEE 754-2008 maxNum semantics, so just use it.
     let root = lasx_xvfmax_s(lasx_xvfmul_s(lasx_xvfsub_s(nb, sq), inv2av), lasx_xvfmul_s(lasx_xvfadd_s(nb, sq), inv2av));
     let valid = lasx_xvand_v(
-      lasx_xvand_v(lasx_xvfcmp_clt_s(zero, det), lasx_xvfcmp_clt_s(zero, lasx_xvfmul_s(rv, root))),
+      lasx_xvand_v(lasx_xvfcmp_cle_s(zero, det), lasx_xvfcmp_cle_s(zero, lasx_xvfmul_s(rv, root))),
       lasx_xvfcmp_clt_s(abs_float(root), inf),
     );
     lut_store(chunk, lut, lut_indices(root, valid, scalev));
@@ -494,7 +483,7 @@ pub(super) fn focal_lut_over_lasx(dst: &mut [u32], lut: &[u32], g0x: f32, g0y: f
     let nb = lasx_xvfsub_s(zero, b);
     let root = lasx_xvfmax_s(lasx_xvfmul_s(lasx_xvfsub_s(nb, sq), inv2av), lasx_xvfmul_s(lasx_xvfadd_s(nb, sq), inv2av));
     let valid = lasx_xvand_v(
-      lasx_xvand_v(lasx_xvfcmp_clt_s(zero, det), lasx_xvfcmp_clt_s(zero, lasx_xvfmul_s(rv, root))),
+      lasx_xvand_v(lasx_xvfcmp_cle_s(zero, det), lasx_xvfcmp_cle_s(zero, lasx_xvfmul_s(rv, root))),
       lasx_xvfcmp_clt_s(abs_float(root), inf),
     );
     lut_blend_over_k255(chunk, lut, lut_indices(root, valid, scalev));

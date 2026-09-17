@@ -59,14 +59,18 @@ fn use_avx512() -> bool {
   cpuid::avx512()
 }
 
-/// Cached (once per process) runtime LASX availability. Unlike x86 there is
-/// no user-mode way to ask whether the kernel saves the 256-bit register
-/// state, so only the OS-provided hwcaps behind `is_loongarch_feature_detected!`
-/// are trusted; the `lasx` feature therefore requires `std`.
-#[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
+/// Cached (once per process) runtime LASX availability.
+#[cfg(all(target_arch = "loongarch64", feature = "lasx", feature = "std"))]
 fn use_lasx() -> bool {
   static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
   *CACHE.get_or_init(|| std::arch::is_loongarch_feature_detected!("lasx"))
+}
+
+/// `is_loongarch_feature_detected!` is a `std` macro, so `no_std` reads the
+/// kernel's `AT_HWCAP` directly.
+#[cfg(all(target_arch = "loongarch64", feature = "lasx", not(feature = "std")))]
+fn use_lasx() -> bool {
+  cpuid::lasx()
 }
 
 /// Coverage-modulated solid source-over: for each pixel,
@@ -1945,7 +1949,7 @@ mod neon;
 #[path = "simd/wasm.rs"]
 mod wasm128;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
 #[path = "simd/cpuid.rs"]
 mod cpuid;
 

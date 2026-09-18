@@ -1,33 +1,37 @@
 //! LASX kernels, 8 pixels (u32) / 32 pixels (Alpha8) per iteration.
 
 use core::arch::loongarch64::{
-  lasx_cast_128, lasx_extract_128_hi, lasx_vext2xv_hu_bu, lasx_xbnz_h, lasx_xbz_v, lasx_xvadd_h, lasx_xvand_v, lasx_xvbitclri_w, lasx_xvfadd_s, lasx_xvfcmp_cle_s, lasx_xvfcmp_clt_s, lasx_xvfmax_s,
-  lasx_xvfmin_s, lasx_xvfmul_s, lasx_xvfsqrt_s, lasx_xvfsub_s, lasx_xvftintrz_w_s, lasx_xvilvl_b, lasx_xvilvl_h, lasx_xvinsgr2vr_w, lasx_xvld, lasx_xvmax_h, lasx_xvmin_h, lasx_xvmul_h, lasx_xvorn_v,
-  lasx_xvpermi_d, lasx_xvreplgr2vr_d, lasx_xvreplgr2vr_h, lasx_xvreplgr2vr_w, lasx_xvrepli_h, lasx_xvrepli_w, lasx_xvseq_h, lasx_xvshuf4i_h, lasx_xvsrli_h, lasx_xvssrani_bu_h, lasx_xvst,
-  lasx_xvsub_h, m256, m256i,
+  lasx_xbnz_h, lasx_xbz_v, lasx_xvadd_h, lasx_xvand_v, lasx_xvbitclri_w, lasx_xvfadd_s, lasx_xvfcmp_cle_s, lasx_xvfcmp_clt_s, lasx_xvfmax_s, lasx_xvfmin_s, lasx_xvfmul_s, lasx_xvfsqrt_s,
+  lasx_xvfsub_s, lasx_xvftintrz_w_s, lasx_xvilvh_b, lasx_xvilvl_b, lasx_xvilvl_h, lasx_xvinsgr2vr_w, lasx_xvld, lasx_xvldi, lasx_xvmax_h, lasx_xvmin_h, lasx_xvmuh_hu, lasx_xvmul_h, lasx_xvorn_v,
+  lasx_xvpickev_b, lasx_xvreplgr2vr_b, lasx_xvreplgr2vr_d, lasx_xvreplgr2vr_h, lasx_xvreplgr2vr_w, lasx_xvrepli_h, lasx_xvrepli_w, lasx_xvseq_h, lasx_xvshuf4i_h, lasx_xvsrli_h, lasx_xvst,
+  lasx_xvsub_h, lasx_xvxor_v, m256, m256i,
 };
 
-/// Widens the low 16 bytes of `v` (first 4 pixels) to 16 u16 lanes.
+/// Widens the low 8 bytes of each 128-bit lane (pixels 0-1 and 4-5) to 16 u16
+/// lanes. Staying lane-local lets [`pack`] restore byte order without the
+/// cross-lane permutes a `vext2xv` layout needs.
 #[inline]
 #[target_feature(enable = "lasx")]
 fn lo(v: m256i) -> m256i {
-  lasx_vext2xv_hu_bu(v)
+  lasx_xvilvl_b(lasx_xvldi::<0>(), v)
 }
 
-/// Widens the high 16 bytes of `v` (last 4 pixels) to 16 u16 lanes.
+/// Widens the high 8 bytes of each 128-bit lane (pixels 2-3 and 6-7) to 16 u16
+/// lanes.
 #[inline]
 #[target_feature(enable = "lasx")]
 fn hi(v: m256i) -> m256i {
-  lasx_vext2xv_hu_bu(lasx_cast_128(lasx_extract_128_hi(v)))
+  lasx_xvilvh_b(lasx_xvldi::<0>(), v)
 }
 
-/// Exact `(n + 127) / 255` on u16 lanes (n <= 65025).
+/// Exact `(n + 127) / 255` on u16 lanes (n <= 65025): `(x * 0x8081) >> 23`
+/// with `x = n + 127`, the multiply-high form LLVM itself emits for the scalar
+/// division. It equals `x / 255` for every `x < 66299`, and `x` stays
+/// `<= 65152` here, so the result is bit-identical to the scalar oracle.
 #[inline]
 #[target_feature(enable = "lasx")]
 fn div255_round(n: m256i) -> m256i {
-  let t = lasx_xvadd_h(n, lasx_xvrepli_h(127));
-  let u = lasx_xvadd_h(lasx_xvadd_h(t, lasx_xvsrli_h::<8>(t)), lasx_xvrepli_h(1));
-  lasx_xvsrli_h::<8>(u)
+  lasx_xvsrli_h::<7>(lasx_xvmuh_hu(lasx_xvadd_h(n, lasx_xvrepli_h(127)), lasx_xvreplgr2vr_h(0x8081)))
 }
 
 /// Premultiplied source-over on u16 channel lanes.
@@ -43,20 +47,25 @@ fn alpha_over8(dst: m256i, source: m256i) -> m256i {
   over(dst, source, lasx_xvsub_h(lasx_xvrepli_h(255), source))
 }
 
-/// Replicates each 16-lane half's alpha (channels 3/7/11/15) across its
-/// pixel's four channel lanes
+/// Replicates each half's alpha (channels 3/7 of every 128-bit lane) across
+/// its pixel's four channel lanes
 #[inline]
 #[target_feature(enable = "lasx")]
 fn splat_alpha(half: m256i) -> m256i {
   lasx_xvshuf4i_h::<0xFF>(half)
 }
 
-/// Packs two 16-u16 halves into 32 bytes with the correct interleaved order
-/// (xvssrani is lane-local, so re-order the middle 64-bit lanes).
+/// Packs two 16-u16 halves into 32 bytes by keeping each lane's low byte.
+/// [`lo`]/[`hi`] are lane-local, so the lane-local `xvpickev` lands every byte
+/// back in place. Every caller passes lanes that are already `<= 255`
+/// (`div255_round` results, `over`'s clamp, or sums/differences bounded by
+/// them), so this truncation is exact and cheaper than a saturating
+/// `xvssrani`. `xvpickev` takes its low half from the second operand, so the
+/// halves are swapped.
 #[inline]
 #[target_feature(enable = "lasx")]
 fn pack(a: m256i, b: m256i) -> m256i {
-  lasx_xvpermi_d(lasx_xvssrani_bu_h(b, a, 0), 0xD8)
+  lasx_xvpickev_b(b, a)
 }
 
 /// Unaligned 32-byte load.
@@ -146,16 +155,14 @@ pub(super) fn alpha_multiply_lasx(dst: &mut [u8], factors: &[u8]) {
 #[target_feature(enable = "lasx")]
 pub(super) fn alpha_matte_lasx(dst: &mut [u8], src: &[u8], opacity: u8, inverted: bool) {
   let opacity = lasx_xvreplgr2vr_h(i32::from(opacity));
-  let full = lasx_xvrepli_h(255);
+  // `255 - f == f ^ 255` for `f <= 255`: inverting by xor keeps the loop free
+  // of a per-chunk select on `inverted`.
+  let invert = lasx_xvreplgr2vr_h(if inverted { 255 } else { 0 });
   for (dst, src) in dst.chunks_exact_mut(32).zip(src.chunks_exact(32)) {
     let d = load(dst.as_ptr());
     let s = load(src.as_ptr());
-    let mut fl = div255_round(lasx_xvmul_h(lo(s), opacity));
-    let mut fh = div255_round(lasx_xvmul_h(hi(s), opacity));
-    if inverted {
-      fl = lasx_xvsub_h(full, fl);
-      fh = lasx_xvsub_h(full, fh);
-    }
+    let fl = lasx_xvxor_v(div255_round(lasx_xvmul_h(lo(s), opacity)), invert);
+    let fh = lasx_xvxor_v(div255_round(lasx_xvmul_h(hi(s), opacity)), invert);
     let l = div255_round(lasx_xvmul_h(lo(d), fl));
     let h = div255_round(lasx_xvmul_h(hi(d), fh));
     store(dst.as_mut_ptr(), pack(l, h));
@@ -165,26 +172,30 @@ pub(super) fn alpha_matte_lasx(dst: &mut [u8], src: &[u8], opacity: u8, inverted
 #[target_feature(enable = "lasx")]
 pub(super) fn alpha_mask_combine_lasx(dst: &mut [u8], src: &[u8], mode: u8, inverted: bool, opacity: u8) {
   let opacity = lasx_xvreplgr2vr_h(i32::from(opacity));
+  // `255 - s == s ^ 0xff` on bytes, applied before widening.
+  let invert = lasx_xvreplgr2vr_b(if inverted { -1 } else { 0 });
   let full = lasx_xvrepli_h(255);
+  // Dispatch on `mode` once, so each pixel loop has no mode branch.
+  match mode {
+    b's' => mask_combine_loop(dst, src, invert, opacity, |old, contribution| div255_round(lasx_xvmul_h(old, lasx_xvsub_h(full, contribution)))),
+    b'i' => mask_combine_loop(dst, src, invert, opacity, |old, contribution| div255_round(lasx_xvmul_h(old, contribution))),
+    b'f' => mask_combine_loop(dst, src, invert, opacity, |old, contribution| {
+      lasx_xvsub_h(lasx_xvmax_h(old, contribution), lasx_xvmin_h(old, contribution))
+    }),
+    _ => mask_combine_loop(dst, src, invert, opacity, |old, contribution| {
+      lasx_xvadd_h(contribution, div255_round(lasx_xvmul_h(lasx_xvsub_h(full, contribution), old)))
+    }),
+  }
+}
+
+#[inline]
+#[target_feature(enable = "lasx")]
+fn mask_combine_loop(dst: &mut [u8], src: &[u8], invert: m256i, opacity: m256i, combine: impl Fn(m256i, m256i) -> m256i) {
   for (dst, src) in dst.chunks_exact_mut(32).zip(src.chunks_exact(32)) {
     let d = load(dst.as_ptr());
-    let s = load(src.as_ptr());
-    let (dl, dh) = (lo(d), hi(d));
-    let (mut sl, mut sh) = (lo(s), hi(s));
-    if inverted {
-      sl = lasx_xvsub_h(full, sl);
-      sh = lasx_xvsub_h(full, sh);
-    }
-    let (cl, ch) = (div255_round(lasx_xvmul_h(sl, opacity)), div255_round(lasx_xvmul_h(sh, opacity)));
-    let combine = |old: m256i, contribution: m256i| -> m256i {
-      match mode {
-        b's' => div255_round(lasx_xvmul_h(old, lasx_xvsub_h(full, contribution))),
-        b'i' => div255_round(lasx_xvmul_h(old, contribution)),
-        b'f' => lasx_xvsub_h(lasx_xvmax_h(old, contribution), lasx_xvmin_h(old, contribution)),
-        _ => lasx_xvadd_h(contribution, div255_round(lasx_xvmul_h(lasx_xvsub_h(full, contribution), old))),
-      }
-    };
-    store(dst.as_mut_ptr(), pack(combine(dl, cl), combine(dh, ch)));
+    let s = lasx_xvxor_v(load(src.as_ptr()), invert);
+    let (cl, ch) = (div255_round(lasx_xvmul_h(lo(s), opacity)), div255_round(lasx_xvmul_h(hi(s), opacity)));
+    store(dst.as_mut_ptr(), pack(combine(lo(d), cl), combine(hi(d), ch)));
   }
 }
 
@@ -196,14 +207,12 @@ pub(super) fn alpha_mask_combine_lasx(dst: &mut [u8], src: &[u8], mode: u8, inve
 pub(super) fn apply_matte_alpha_lasx(dst: &mut [u32], src: &[u32], source_opacity: u8, inverted: bool) {
   let opacity = lasx_xvreplgr2vr_h(i32::from(source_opacity));
   let full = lasx_xvrepli_h(255);
+  // `255 - f == f ^ 255` for `f <= 255`, without a per-chunk select.
+  let invert = lasx_xvreplgr2vr_h(if inverted { 255 } else { 0 });
   for (dpx, spx) in dst.chunks_exact_mut(8).zip(src.chunks_exact(8)) {
     let s = load(spx.as_ptr().cast());
-    let mut fl = div255_round(lasx_xvmul_h(splat_alpha(lo(s)), opacity));
-    let mut fh = div255_round(lasx_xvmul_h(splat_alpha(hi(s)), opacity));
-    if inverted {
-      fl = lasx_xvsub_h(full, fl);
-      fh = lasx_xvsub_h(full, fh);
-    }
+    let fl = lasx_xvxor_v(div255_round(lasx_xvmul_h(splat_alpha(lo(s)), opacity)), invert);
+    let fh = lasx_xvxor_v(div255_round(lasx_xvmul_h(splat_alpha(hi(s)), opacity)), invert);
     if lasx_xbnz_h(lasx_xvseq_h(fl, full)) == 1 && lasx_xbnz_h(lasx_xvseq_h(fh, full)) == 1 {
       continue;
     }
@@ -224,8 +233,9 @@ pub(super) fn fill_span_solid_lasx(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32
   let sa_w = lasx_xvreplgr2vr_h(sa as i32);
   let full = lasx_xvrepli_h(255);
   for (dpx, cpx) in dst.chunks_exact_mut(8).zip(cov.chunks_exact(8)) {
-    // rep4: byte-double then word-double, per 4-byte group.
-    // xvilvl is per 128-bit lane.
+    // rep4: byte-double then word-double, per 4-byte group. xvilvl is per
+    // 128-bit lane, so `crep` keeps the coverage in memory order and lines up
+    // with `lo`/`hi` of the destination.
     let c0 = lasx_xvreplgr2vr_w(u32::from_le_bytes(cpx[0..4].try_into().unwrap_or([0; 4])) as i32);
     let c1 = lasx_xvinsgr2vr_w::<4>(c0, u32::from_le_bytes(cpx[4..8].try_into().unwrap_or([0; 4])) as i32);
     let crep = lasx_xvilvl_h(lasx_xvilvl_b(c1, c1), lasx_xvilvl_b(c1, c1));
@@ -488,31 +498,5 @@ pub(super) fn focal_lut_over_lasx(dst: &mut [u32], lut: &[u32], g0x: f32, g0y: f
     );
     lut_blend_over_k255(chunk, lut, lut_indices(root, valid, scalev));
     kf = lasx_xvfadd_s(kf, eight);
-  }
-}
-
-/// Opaque (sa=255) 8-pixel solid fill: if every coverage byte in the chunk is
-/// 255 the output is exactly `color` (a plain vector store, matching the scalar
-/// `run.fill(color)`), otherwise each pixel falls back to the exact scalar formula.
-/// Splits the caller's span into SIMD_MIN_SPAN-aligned chunks; the caller handles
-/// the scalar tail. Bit-exact: all-255 chunks store the source color verbatim,
-/// and mixed chunks run the identical rounded scalar math.
-#[target_feature(enable = "lasx")]
-pub(super) fn fill_span_opaque_lasx(dst: &mut [u32], cov: &[u8], color: u32) {
-  let colorv = lasx_xvreplgr2vr_w(color as i32);
-  for (dpx, cpx) in dst.chunks_exact_mut(8).zip(cov.chunks_exact(8)) {
-    // The coverage test reads the chunk as one u64: exactly the 8 bytes this
-    // iteration owns. A 256-bit load takes in the next 24 as well, which runs
-    // past the slice on the final chunk, and demands all 32 be 255 before the
-    // fast path can fire.
-    let all255 = u64::from_le_bytes(cpx.try_into().unwrap_or([0; 8])) == u64::MAX;
-    if all255 {
-      #[allow(unsafe_code)]
-      unsafe {
-        lasx_xvst(colorv, dpx.as_mut_ptr().cast(), 0)
-      }
-    } else {
-      super::fill_span_solid_scalar(dpx, cpx, (color >> 0) & 0xff, (color >> 8) & 0xff, (color >> 16) & 0xff, 255);
-    }
   }
 }

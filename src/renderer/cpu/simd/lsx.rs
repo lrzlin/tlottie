@@ -1,32 +1,34 @@
 //! LSX kernels, 4 pixels (u32) / 16 pixels (Alpha8) per iteration.
 
 use core::arch::loongarch64::{
-  lsx_bnz_h, lsx_bz_v, lsx_vadd_h, lsx_vand_v, lsx_vbitclri_w, lsx_vexth_hu_bu, lsx_vfadd_s, lsx_vfcmp_cle_s, lsx_vfcmp_clt_s, lsx_vfmax_s, lsx_vfmin_s, lsx_vfmul_s, lsx_vfsqrt_s, lsx_vfsub_s,
-  lsx_vftintrz_w_s, lsx_vilvl_b, lsx_vilvl_h, lsx_vld, lsx_vmax_h, lsx_vmin_h, lsx_vmul_h, lsx_vorn_v, lsx_vreplgr2vr_d, lsx_vreplgr2vr_h, lsx_vreplgr2vr_w, lsx_vrepli_h, lsx_vrepli_w, lsx_vseq_h,
-  lsx_vshuf4i_h, lsx_vsllwil_hu_bu, lsx_vsrli_h, lsx_vssrani_bu_h, lsx_vst, lsx_vsub_h, m128, m128i,
+  lsx_bnz_h, lsx_bz_v, lsx_vadd_h, lsx_vand_v, lsx_vbitclri_w, lsx_vfadd_s, lsx_vfcmp_cle_s, lsx_vfcmp_clt_s, lsx_vfmax_s, lsx_vfmin_s, lsx_vfmul_s, lsx_vfsqrt_s, lsx_vfsub_s, lsx_vftintrz_w_s,
+  lsx_vilvh_b, lsx_vilvl_b, lsx_vilvl_h, lsx_vld, lsx_vldi, lsx_vmax_h, lsx_vmin_h, lsx_vmuh_hu, lsx_vmul_h, lsx_vorn_v, lsx_vpickev_b, lsx_vreplgr2vr_b, lsx_vreplgr2vr_d, lsx_vreplgr2vr_h,
+  lsx_vreplgr2vr_w, lsx_vrepli_h, lsx_vrepli_w, lsx_vseq_h, lsx_vshuf4i_h, lsx_vsrli_h, lsx_vst, lsx_vsub_h, lsx_vxor_v, m128, m128i,
 };
 
-/// Widens the low 8 bytes of `v` (first 2 pixels) to 8 u16 lanes.
+/// Widens the low 8 bytes of `v` (first 2 pixels) to 8 u16 lanes. Interleaving
+/// with zero measures faster than `vsllwil` on LA664.
 #[inline]
 #[target_feature(enable = "lsx")]
 fn lo(v: m128i) -> m128i {
-  lsx_vsllwil_hu_bu::<0>(v)
+  lsx_vilvl_b(lsx_vldi::<0>(), v)
 }
 
 /// Widens the high 8 bytes of `v` (last 2 pixels) to 8 u16 lanes.
 #[inline]
 #[target_feature(enable = "lsx")]
 fn hi(v: m128i) -> m128i {
-  lsx_vexth_hu_bu(v)
+  lsx_vilvh_b(lsx_vldi::<0>(), v)
 }
 
-/// Exact `(n + 127) / 255` on u16 lanes (n <= 65025).
+/// Exact `(n + 127) / 255` on u16 lanes (n <= 65025): `(x * 0x8081) >> 23`
+/// with `x = n + 127`, the multiply-high form LLVM itself emits for the scalar
+/// division. It equals `x / 255` for every `x < 66299`, and `x` stays
+/// `<= 65152` here, so the result is bit-identical to the scalar oracle.
 #[inline]
 #[target_feature(enable = "lsx")]
 fn div255_round(n: m128i) -> m128i {
-  let t = lsx_vadd_h(n, lsx_vrepli_h(127));
-  let u = lsx_vadd_h(lsx_vadd_h(t, lsx_vsrli_h::<8>(t)), lsx_vrepli_h(1));
-  lsx_vsrli_h::<8>(u)
+  lsx_vsrli_h::<7>(lsx_vmuh_hu(lsx_vadd_h(n, lsx_vrepli_h(127)), lsx_vreplgr2vr_h(0x8081)))
 }
 
 /// Premultiplied source-over on u16 channel lanes.
@@ -50,12 +52,15 @@ fn splat_alpha(half: m128i) -> m128i {
   lsx_vshuf4i_h::<0xFF>(half)
 }
 
-/// Packs two 8-u16 halves into 16 bytes. `vssrani` takes its low half from the
-/// second operand, so the halves are passed swapped.
+/// Packs two 8-u16 halves into 16 bytes by keeping each lane's low byte.
+/// Every caller passes lanes that are already `<= 255` (`div255_round`
+/// results, `over`'s clamp, or sums/differences bounded by them), so this
+/// truncation is exact and cheaper than a saturating `vssrani`. `vpickev`
+/// takes its low half from the second operand, so the halves are swapped.
 #[inline]
 #[target_feature(enable = "lsx")]
 fn pack(a: m128i, b: m128i) -> m128i {
-  lsx_vssrani_bu_h(b, a, 0)
+  lsx_vpickev_b(b, a)
 }
 
 /// Unaligned 16-byte load.
@@ -145,16 +150,14 @@ pub(super) fn alpha_multiply_lsx(dst: &mut [u8], factors: &[u8]) {
 #[target_feature(enable = "lsx")]
 pub(super) fn alpha_matte_lsx(dst: &mut [u8], src: &[u8], opacity: u8, inverted: bool) {
   let opacity = lsx_vreplgr2vr_h(i32::from(opacity));
-  let full = lsx_vrepli_h(255);
+  // `255 - f == f ^ 255` for `f <= 255`: inverting by xor keeps the loop free
+  // of a per-chunk select on `inverted`.
+  let invert = lsx_vreplgr2vr_h(if inverted { 255 } else { 0 });
   for (dst, src) in dst.chunks_exact_mut(16).zip(src.chunks_exact(16)) {
     let d = load(dst.as_ptr());
     let s = load(src.as_ptr());
-    let mut fl = div255_round(lsx_vmul_h(lo(s), opacity));
-    let mut fh = div255_round(lsx_vmul_h(hi(s), opacity));
-    if inverted {
-      fl = lsx_vsub_h(full, fl);
-      fh = lsx_vsub_h(full, fh);
-    }
+    let fl = lsx_vxor_v(div255_round(lsx_vmul_h(lo(s), opacity)), invert);
+    let fh = lsx_vxor_v(div255_round(lsx_vmul_h(hi(s), opacity)), invert);
     let l = div255_round(lsx_vmul_h(lo(d), fl));
     let h = div255_round(lsx_vmul_h(hi(d), fh));
     store(dst.as_mut_ptr(), pack(l, h));
@@ -164,26 +167,28 @@ pub(super) fn alpha_matte_lsx(dst: &mut [u8], src: &[u8], opacity: u8, inverted:
 #[target_feature(enable = "lsx")]
 pub(super) fn alpha_mask_combine_lsx(dst: &mut [u8], src: &[u8], mode: u8, inverted: bool, opacity: u8) {
   let opacity = lsx_vreplgr2vr_h(i32::from(opacity));
+  // `255 - s == s ^ 0xff` on bytes, applied before widening.
+  let invert = lsx_vreplgr2vr_b(if inverted { -1 } else { 0 });
   let full = lsx_vrepli_h(255);
+  // Dispatch on `mode` once, so each pixel loop has no mode branch.
+  match mode {
+    b's' => mask_combine_loop(dst, src, invert, opacity, |old, contribution| div255_round(lsx_vmul_h(old, lsx_vsub_h(full, contribution)))),
+    b'i' => mask_combine_loop(dst, src, invert, opacity, |old, contribution| div255_round(lsx_vmul_h(old, contribution))),
+    b'f' => mask_combine_loop(dst, src, invert, opacity, |old, contribution| lsx_vsub_h(lsx_vmax_h(old, contribution), lsx_vmin_h(old, contribution))),
+    _ => mask_combine_loop(dst, src, invert, opacity, |old, contribution| {
+      lsx_vadd_h(contribution, div255_round(lsx_vmul_h(lsx_vsub_h(full, contribution), old)))
+    }),
+  }
+}
+
+#[inline]
+#[target_feature(enable = "lsx")]
+fn mask_combine_loop(dst: &mut [u8], src: &[u8], invert: m128i, opacity: m128i, combine: impl Fn(m128i, m128i) -> m128i) {
   for (dst, src) in dst.chunks_exact_mut(16).zip(src.chunks_exact(16)) {
     let d = load(dst.as_ptr());
-    let s = load(src.as_ptr());
-    let (dl, dh) = (lo(d), hi(d));
-    let (mut sl, mut sh) = (lo(s), hi(s));
-    if inverted {
-      sl = lsx_vsub_h(full, sl);
-      sh = lsx_vsub_h(full, sh);
-    }
-    let (cl, ch) = (div255_round(lsx_vmul_h(sl, opacity)), div255_round(lsx_vmul_h(sh, opacity)));
-    let combine = |old: m128i, contribution: m128i| -> m128i {
-      match mode {
-        b's' => div255_round(lsx_vmul_h(old, lsx_vsub_h(full, contribution))),
-        b'i' => div255_round(lsx_vmul_h(old, contribution)),
-        b'f' => lsx_vsub_h(lsx_vmax_h(old, contribution), lsx_vmin_h(old, contribution)),
-        _ => lsx_vadd_h(contribution, div255_round(lsx_vmul_h(lsx_vsub_h(full, contribution), old))),
-      }
-    };
-    store(dst.as_mut_ptr(), pack(combine(dl, cl), combine(dh, ch)));
+    let s = lsx_vxor_v(load(src.as_ptr()), invert);
+    let (cl, ch) = (div255_round(lsx_vmul_h(lo(s), opacity)), div255_round(lsx_vmul_h(hi(s), opacity)));
+    store(dst.as_mut_ptr(), pack(combine(lo(d), cl), combine(hi(d), ch)));
   }
 }
 
@@ -195,14 +200,12 @@ pub(super) fn alpha_mask_combine_lsx(dst: &mut [u8], src: &[u8], mode: u8, inver
 pub(super) fn apply_matte_alpha_lsx(dst: &mut [u32], src: &[u32], source_opacity: u8, inverted: bool) {
   let opacity = lsx_vreplgr2vr_h(i32::from(source_opacity));
   let full = lsx_vrepli_h(255);
+  // `255 - f == f ^ 255` for `f <= 255`, without a per-chunk select.
+  let invert = lsx_vreplgr2vr_h(if inverted { 255 } else { 0 });
   for (dpx, spx) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
     let s = load(spx.as_ptr().cast());
-    let mut fl = div255_round(lsx_vmul_h(splat_alpha(lo(s)), opacity));
-    let mut fh = div255_round(lsx_vmul_h(splat_alpha(hi(s)), opacity));
-    if inverted {
-      fl = lsx_vsub_h(full, fl);
-      fh = lsx_vsub_h(full, fh);
-    }
+    let fl = lsx_vxor_v(div255_round(lsx_vmul_h(splat_alpha(lo(s)), opacity)), invert);
+    let fh = lsx_vxor_v(div255_round(lsx_vmul_h(splat_alpha(hi(s)), opacity)), invert);
     if lsx_bnz_h(lsx_vseq_h(fl, full)) == 1 && lsx_bnz_h(lsx_vseq_h(fh, full)) == 1 {
       continue;
     }
@@ -486,31 +489,5 @@ pub(super) fn focal_lut_over_lsx(dst: &mut [u32], lut: &[u32], g0x: f32, g0y: f3
     );
     lut_blend_over_k255(chunk, lut, lut_indices(root, valid, scalev));
     kf = lsx_vfadd_s(kf, four);
-  }
-}
-
-/// Opaque (sa=255) 4-pixel solid fill: if every coverage byte in the chunk is
-/// 255 the output is exactly `color` (a plain vector store, matching the scalar
-/// `run.fill(color)`), otherwise each pixel falls back to the exact scalar formula.
-/// Splits the caller's span into SIMD_MIN_SPAN-aligned chunks; the caller handles
-/// the scalar tail. Bit-exact: all-255 chunks store the source color verbatim,
-/// and mixed chunks run the identical rounded scalar math.
-#[target_feature(enable = "lsx")]
-pub(super) fn fill_span_opaque_lsx(dst: &mut [u32], cov: &[u8], color: u32) {
-  let colorv = lsx_vreplgr2vr_w(color as i32);
-  for (dpx, cpx) in dst.chunks_exact_mut(4).zip(cov.chunks_exact(4)) {
-    // The coverage test reads the chunk as one u32: exactly the 4 bytes this
-    // iteration owns. A 128-bit load takes in the next 12 as well, which runs
-    // past the slice on the final chunk, and demands all 16 be 255 before the
-    // fast path can fire.
-    let all255 = u32::from_le_bytes(cpx.try_into().unwrap_or([0; 4])) == u32::MAX;
-    if all255 {
-      #[allow(unsafe_code)]
-      unsafe {
-        lsx_vst(colorv, dpx.as_mut_ptr().cast(), 0)
-      }
-    } else {
-      super::fill_span_solid_scalar(dpx, cpx, (color >> 0) & 0xff, (color >> 8) & 0xff, (color >> 16) & 0xff, 255);
-    }
   }
 }

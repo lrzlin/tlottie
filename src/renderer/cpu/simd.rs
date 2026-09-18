@@ -140,34 +140,10 @@ pub(crate) fn fill_span_solid(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb:
       fill_span_solid_scalar(dst_tail, cov_tail, sr, sg, sb, sa);
       return;
     }
-    #[cfg(all(target_arch = "loongarch64", feature = "lasx"))]
-    if _large_canvas && dst.len() >= SIMD_MIN_SPAN && use_lasx() {
-      let n = dst.len().min(cov.len());
-      let full = n - n % 8;
-      let (dst_v, dst_tail) = dst.split_at_mut(full);
-      let (cov_v, cov_tail) = cov.split_at(full);
-      // SAFETY: `use_lasx()` gates on `is_loongarch_feature_detected!("lasx")`.
-      #[allow(unsafe_code)]
-      unsafe {
-        lasx::fill_span_opaque_lasx(dst_v, cov_v, color)
-      }
-      fill_span_solid_scalar(dst_tail, cov_tail, sr, sg, sb, sa);
-      return;
-    }
-    #[cfg(all(target_arch = "loongarch64", feature = "lsx"))]
-    if _large_canvas && dst.len() >= SIMD_MIN_SPAN && use_lsx() {
-      let n = dst.len().min(cov.len());
-      let full = n - n % 4;
-      let (dst_v, dst_tail) = dst.split_at_mut(full);
-      let (cov_v, cov_tail) = cov.split_at(full);
-      // SAFETY: `use_lsx()` gates on `is_loongarch_feature_detected!("lsx")`.
-      #[allow(unsafe_code)]
-      unsafe {
-        lsx::fill_span_opaque_lsx(dst_v, cov_v, color)
-      }
-      fill_span_solid_scalar(dst_tail, cov_tail, sr, sg, sb, sa);
-      return;
-    }
+    // No LoongArch opaque kernel on purpose: on a 3B6000 the chunked LSX/LASX
+    // store lost to the run-length fill below (e.g. windmill at 320px: LASX
+    // 0.70x), because any AA edge sends its whole chunk to the per-pixel
+    // formula while the scalar path fills maximal runs.
     let n = dst.len().min(cov.len());
     let mut i = 0usize;
     while i < n {
